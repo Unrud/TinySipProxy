@@ -9,8 +9,11 @@
 #include <ctype.h>
 
 #define USER_AGENT "TINY!SIP!PROXY"
+static const unsigned short PING_TIMEOUT = 1;
 static const size_t BUFLEN = 64 * 1024;
 static const size_t BRANCHLEN = 36;
+static const size_t TAGLEN = 16;
+static const size_t LOCAL_CONTACT_LEN = 32;
 
 static const unsigned short SIP_PORT = 5060;
 static const size_t MAX_IPV6_LEN = strlen("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff");
@@ -313,7 +316,6 @@ static int find_attribute(struct header_entry header_entry, const char *name,
     return 0;
 }
 
-__attribute__((unused))
 static int copy_header(char *buf, size_t *recvlen, size_t buflen,
                        char *start_of_header, const char *name, const char *alt_name) {
     while (1) {
@@ -353,10 +355,105 @@ static int parse_via_header(struct header_entry via_header, struct sockaddr_in6 
     return 0;
 }
 
+static int is_ping(char *buf, size_t recvlen, struct sockaddr_in6 si_remote) {
+    struct header_entry length_header;
+    if (find_header_entry(buf, "Content-Length", "l", 1, &length_header) == 0) {
+        char *end_of_length;
+        if (strtoul(length_header.column_start, &end_of_length, 10) != 0 ||
+                end_of_length != length_header.column_end) {
+            return -1;
+        }
+    } else {
+        char *end_of_header;
+        if ((end_of_header = strstr(buf, "\r\n\r\n")) == NULL) {
+            return -1;
+        }
+        end_of_header += strlen("\r\n\r\n");
+        if (buf + recvlen != end_of_header) {
+            return -1;
+        }
+    }
+    if (strpbrk(buf, "@\r")[0] == '@' || // e.g. OPTIONS sip:user@server SIP/2.0\r\n...
+            strncmp(buf, "OPTIONS ", strlen("OPTIONS ")) != 0 ||
+            find_header_entry(buf, "Authorization", NULL, 0, NULL) == 0) {
+        return -1;
+    }
+    char addrbuf[MAX_IPV6_LEN + NULL_BYTE_LEN];
+    ip_to_str(si_remote.sin6_addr, addrbuf, sizeof(addrbuf));
+    stack_sprintf(cmdbuf, "ping -c 1 -W %hu -- %s", PING_TIMEOUT, addrbuf);
+    warning_ret_if(system(cmdbuf) != 0, "Host %s unreachable", addrbuf);
+    return 0;
+}
+
+static int make_ping(char *buf, size_t *recvlen, const char *local_contact) {
+    // Reuse end of buf for response, we only need the request header
+    char *tempbuf;
+    if ((tempbuf = strstr(buf, "\r\n\r\n")) != NULL) {
+        tempbuf += strlen("\r\n\r\n"); // end of header
+    } else {
+        tempbuf = buf + *recvlen;
+    }
+    tempbuf++[0] = '\0';
+    size_t tempbuflen = buf + BUFLEN - tempbuf;
+    *recvlen = 0;
+    error_ret_if(str_insert(tempbuf, recvlen, tempbuflen, tempbuf + *recvlen,
+                            "SIP/2.0 401 Unauthorized\r\n", -1) < 0, "packet too big");
+    if (copy_header(tempbuf, recvlen, tempbuflen, buf, "Via", "v") < 0 ||
+            copy_header(tempbuf, recvlen, tempbuflen, buf, "From", "f") < 0 ||
+            copy_header(tempbuf, recvlen, tempbuflen, buf, "To", "t") < 0 ||
+            copy_header(tempbuf, recvlen, tempbuflen, buf, "Call-ID", "i") < 0 ||
+            copy_header(tempbuf, recvlen, tempbuflen, buf, "CSeq", NULL) < 0) {
+        return -1;
+    }
+    struct header_entry to_header;
+    if (find_header_entry(tempbuf, "To", "t", 2, &to_header) == 0 ||
+            find_header_entry(tempbuf, "To", "t", 1, &to_header) == 0) {
+        struct attribute_entry tag_attribute;
+        if (find_attribute(to_header, "tag", &tag_attribute) == 0) {
+            memmove(tag_attribute.start - strlen(";"), tag_attribute.end,
+                    tempbuf + (*recvlen + NULL_BYTE_LEN) - tag_attribute.end);
+            size_t tag_len = tag_attribute.end - (tag_attribute.start - strlen(";"));
+            *recvlen -= tag_len;
+            to_header.column_end -= tag_len;
+            to_header.end -= tag_len;
+        }
+        char tagbuf[TAGLEN + NULL_BYTE_LEN];
+        random_hex_str(tagbuf, TAGLEN);
+        stack_sprintf(tag_attr_buf, ";tag=%s", tagbuf);
+        error_ret_if(str_insert(tempbuf, recvlen, tempbuflen, to_header.column_end,
+                                tag_attr_buf, -1) < 0, "packet too big");
+    }
+    struct header_entry via_header;
+    error_ret_if(find_header_entry(buf, "Via", "v", 2, &via_header) < 0, "invalid packet");
+    error_ret_if(find_header_entry(via_header.end, "Via", "v", 2, &via_header) < 0,
+                 "invalid packet");
+    struct in6_addr outbound_addr;
+    if (parse_via_header(via_header, NULL, &outbound_addr) != 0) {
+        return -1;
+    }
+    char outbound_addrbuf[MAX_IPV6_LEN + NULL_BYTE_LEN];
+    ip_to_str(outbound_addr, outbound_addrbuf, sizeof(outbound_addrbuf));
+    char *before_addr = "", *after_addr = "";
+    if (strchr(outbound_addrbuf, ':') != NULL) {
+        before_addr = "[";
+        after_addr = "]";
+    }
+    stack_sprintf(contactbuf, "Contact: <sip:%s@%s%s%s:%hu>\r\n",
+                  local_contact, before_addr, outbound_addrbuf, after_addr, SIP_PORT);
+    error_ret_if(str_insert(tempbuf, recvlen, tempbuflen, tempbuf + *recvlen,
+                            contactbuf, -1) < 0, "packet too big");
+    error_ret_if(str_insert(tempbuf, recvlen, tempbuflen, tempbuf + *recvlen,
+                            "Content-Length: 0\r\n"
+                            "User-Agent: " USER_AGENT "\r\n\r\n", -1) < 0, "packet too big");
+    memmove(buf, tempbuf, *recvlen + NULL_BYTE_LEN);
+    return 0;
+}
+
 static int handle_message(char *buf, size_t *recvlen, struct sockaddr_in6 si_client,
-                          struct sockaddr_in6 *si_remote) {
+                          struct sockaddr_in6 *si_remote, const char* local_contact) {
     int rc;
     struct header_entry via_header;
+    handle_message_start:
     error_ret_if(strstr(buf, "\r\n\r\n") == NULL, "invalid packet");
     error_ret_if(find_header_entry(buf, "Via", "v", 2, &via_header) < 0, "invalid packet");
     char *start_of_sip, *end_of_sip;
@@ -422,6 +519,12 @@ static int handle_message(char *buf, size_t *recvlen, struct sockaddr_in6 si_cli
                       outbound_addrbuf, after_addr, SIP_PORT, SIP_BRANCH_MAGIC_COOKIE, branchbuf);
         error_ret_if(str_insert(buf, recvlen, BUFLEN, via_header.start, viabuf, -1) < 0,
                      "packet too big");
+        if (is_ping(buf, *recvlen, *si_remote) == 0) {
+            if (make_ping(buf, recvlen, local_contact) < 0) {
+                return -1;
+            }
+            goto handle_message_start;
+        }
     } else {
         // server message
         char *start_of_protocol = buf;
@@ -439,12 +542,13 @@ static int handle_message(char *buf, size_t *recvlen, struct sockaddr_in6 si_cli
 }
 
 int main() {
-    char buf[BUFLEN];
+    char buf[BUFLEN], local_contact[LOCAL_CONTACT_LEN + NULL_BYTE_LEN];
     struct sockaddr_in6 si_server, si_client, si_remote;
     bzero(&si_server, sizeof(si_server));
     si_server.sin6_family = AF_INET6;
     si_server.sin6_port = htons(SIP_PORT);
     si_server.sin6_addr = in6addr_any;
+    random_hex_str(local_contact, LOCAL_CONTACT_LEN);
     int sock;
     fatal_if((sock = socket(AF_INET6, SOCK_DGRAM|SOCK_CLOEXEC, IPPROTO_UDP)) < 0);
     int option_value = 0;
@@ -464,7 +568,7 @@ int main() {
         error_cont_if((size_t) recvlen > BUFLEN - NULL_BYTE_LEN, "packet too big");
         // safe for string functions
         buf[recvlen] = '\0';
-        if (handle_message(buf, (size_t *) &recvlen, si_client, &si_remote) == 0) {
+        if (handle_message(buf, (size_t *) &recvlen, si_client, &si_remote, local_contact) == 0) {
             error_cont_if(sendto(sock, buf, recvlen, 0, (struct sockaddr*) &si_remote,
                                  sizeof(si_remote)) < 0, "failed to send");
         }
