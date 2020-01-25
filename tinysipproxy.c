@@ -446,7 +446,7 @@ int main() {
     si_server.sin6_port = htons(SIP_PORT);
     si_server.sin6_addr = in6addr_any;
     int sock;
-    fatal_if((sock = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP)) < 0);
+    fatal_if((sock = socket(AF_INET6, SOCK_DGRAM|SOCK_CLOEXEC, IPPROTO_UDP)) < 0);
     int option_value = 0;
     fatal_if(setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY, &option_value, sizeof(option_value)) < 0);
     fatal_if(bind(sock, (struct sockaddr*) &si_server, sizeof(si_server)) < 0,
