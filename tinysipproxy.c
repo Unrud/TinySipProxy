@@ -182,7 +182,7 @@ static int parse_address(char *start_of_addr, char *end_of_addr, char **start_of
 static void random_hex_str(char *dst, size_t len) {
     FILE *dev_urandom;
     char rand;
-    fatal_if((dev_urandom = fopen("/dev/urandom", "r")) == NULL, "Failed top open /dev/urandom");
+    fatal_if((dev_urandom = fopen("/dev/urandom", "r")) == NULL, "Failed to open /dev/urandom");
     size_t i;
     for (i = 0; i < len; i += 2) {
         fatal_if(fread(&rand, 1, 1, dev_urandom) != 1);
